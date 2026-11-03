@@ -1,0 +1,8 @@
+{
+  "appId": "com.falcongames.shootdierepeat",
+  "appName": "Shoot Die Repeat",
+  "webDir": "dist",
+  "android": {
+    "allowMixedContent": false
+  }
+}

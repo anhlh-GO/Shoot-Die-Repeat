@@ -1,0 +1,20 @@
+{
+  "name": "shoot-die-repeat",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Shoot Die Repeat (HTML port)",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "@capacitor/android": "^6.2.3",
+    "@capacitor/cli": "^6.2.3",
+    "vite": "^8.3.0"
+  },
+  "dependencies": {
+    "@capacitor/core": "^6.2.3"
+  }
+}
