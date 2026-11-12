@@ -144,6 +144,148 @@ sun.shadow.bias = -0.0008; sun.shadow.normalBias = .02;
 scene.add(sun); scene.add(sun.target);
 const flashLight = new THREE.PointLight(0xffd27a, 0, 6); scene.add(flashLight);
 
+// ---------------------------------------------------------------- art style (post-processed look)
+// ?style=sticker (default) — paper-cutout stickers: flat 2-tone shading, thick white cut border + offset drop shadow
+//                            around everything on the gameplay strip, background flattened into cut-paper colour bands, paper grain.
+// ?style=pixel             — low-res (≈270 rows) nearest-neighbour render, 1-px dark outlines, posterise + Bayer dither.
+// ?style=classic           — the original lit 3D look.
+const STYLE = (() => { const s = qs.get('style'); return s === 'pixel' || s === 'classic' ? s : qs.get('pixel') === '0' ? 'classic' : 'sticker'; })();
+const PIXEL = STYLE === 'pixel', STICKER = STYLE === 'sticker', POST = PIXEL || STICKER;
+const PIXEL_ROWS = 270;
+if (PIXEL) { renderer.shadowMap.type = THREE.BasicShadowMap; sun.shadow.mapSize.set(1024, 1024); }
+function gradTex(levels) {
+  const d = new Uint8Array(levels.length * 4); levels.forEach((v, i) => d.set([v, v, v, 255], i * 4));
+  const t = new THREE.DataTexture(d, levels.length, 1, THREE.RGBAFormat);
+  t.minFilter = t.magFilter = THREE.NearestFilter; t.generateMipmaps = false; t.needsUpdate = true; return t;
+}
+const TOON_GRAD = PIXEL ? gradTex([78, 170, 255]) : gradTex([168, 255]);
+const litMat = (p = {}) => POST ? new THREE.MeshToonMaterial(Object.assign({ gradientMap:TOON_GRAD }, p)) : new THREE.MeshLambertMaterial(p);
+const post = { rt:null, w:1, h:1, px:1, scene:new THREE.Scene(), cam:new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1) };
+const POST_COMMON = `
+  #include <packing>
+  uniform sampler2D tC, tD; uniform vec2 res; uniform float cn, cf, gp, rad; varying vec2 vUv;
+  float lin(vec2 uv){ return -perspectiveDepthToViewZ(texture2D(tD, uv).x, cn, cf); }
+  vec3 toSRGB(vec3 c){ return mix(c * 12.92, 1.055 * pow(c, vec3(1. / 2.4)) - .055, step(vec3(.0031308), c)); }
+  // gp = camera distance to the play plane: things closer than gp + 2.2 are "on the gameplay strip"
+  bool fgEdge(float d, float dn){ return dn < gp + 2.2 && d - dn > .35 + dn * .03; }`;
+const PIXEL_FRAG = POST_COMMON + `
+  float bayer2(vec2 a){ a = floor(a); return fract(dot(a, vec2(.5, a.y * .75))); }
+  float bayer4(vec2 a){ return bayer2(.5 * a) * .25 + bayer2(a); }
+  void main(){
+    vec2 cell = floor(vUv * res), uv = (cell + .5) / res, px = 1. / res;
+    vec3 c = texture2D(tC, uv).rgb; float d = lin(uv);
+    // a pixel just outside a closer silhouette takes a dark tint of that silhouette
+    float dn = d; vec3 nc = c;
+    vec2 o[4]; o[0] = vec2(px.x, 0.); o[1] = vec2(-px.x, 0.); o[2] = vec2(0., px.y); o[3] = vec2(0., -px.y);
+    for (int i = 0; i < 4; i++) { float dd = lin(uv + o[i]); if (dd < dn) { dn = dd; nc = texture2D(tC, uv + o[i]).rgb; } }
+    if (fgEdge(d, dn)) c = nc * .22;
+    vec3 s = toSRGB(clamp(c, 0., 1.));
+    float l = dot(s, vec3(.299, .587, .114)); s = clamp(mix(vec3(l), s, 1.18), 0., 1.);
+    const float L = 14.;
+    s = floor(s * L + bayer4(cell) * .85 + .075) / L;
+    gl_FragColor = vec4(s, 1.);
+  }`;
+// Sticker look. Everything that should read as a cut-out (characters, monsters, weapons, projectiles, props, trees, clouds)
+// lives on layer 1 via sticker(). After the main pass those objects are drawn again as a flat white mask (depth-tested against
+// the main pass, so ground in front still hides them); the post pass dilates that mask into a white cut border, offsets it
+// for a paper drop shadow, splits overlapping stickers at depth jumps, and lays paper grain over the whole frame.
+const STICKER_FRAG = POST_COMMON + `
+  uniform sampler2D tM;
+  float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+  float vnoise(vec2 p){ vec2 i = floor(p), f = fract(p); f = f * f * (3. - 2. * f);
+    return mix(mix(hash(i), hash(i + vec2(1., 0.)), f.x), mix(hash(i + vec2(0., 1.)), hash(i + 1.), f.x), f.y); }
+  float mk(vec2 uv){ return texture2D(tM, uv).r; }
+  // mask dilated by r pixels (16 directions x 3 rings; linear filtering of the mask softens the outer edge)
+  float dilate(vec2 uv, float r){
+    vec2 px = 1. / res; float v = mk(uv);
+    for (int i = 0; i < 16; i++) {
+      float a = float(i) * .3927; vec2 o = vec2(cos(a), sin(a)) * px * r;
+      v = max(v, max(mk(uv + o * .35), max(mk(uv + o * .7), mk(uv + o))));
+    }
+    return v;
+  }
+  void main(){
+    vec2 px = 1. / res;
+    vec3 c = texture2D(tC, vUv).rgb; float d = lin(vUv); float m = mk(vUv);
+    // white cut border around the sticker
+    float b = clamp(dilate(vUv, rad) - m, 0., 1.);
+    // thin white split where one sticker overlaps another that is clearly further back
+    float sep = 0.;
+    if (m > .5) for (int i = 0; i < 8; i++) {
+      float a = float(i) * .7854; vec2 o = vec2(cos(a), sin(a)) * px * rad * .4;
+      if (mk(vUv + o) > .5 && d - lin(vUv + o) > .45) sep = 1.;
+    }
+    // paper drop shadow: the bordered sticker shifted down-right
+    float sh = (1. - m) * (1. - b) * dilate(vUv + vec2(-.55, .75) * px * rad * 1.6, rad);
+    vec3 s = toSRGB(clamp(c, 0., 1.));
+    float l = dot(s, vec3(.299, .587, .114));
+    if (m > .5) s = clamp(mix(vec3(l), s, 1.15), 0., 1.);
+    else if (d > gp + 3.) { s = mix(vec3(l), s, .88); s = mix(s, vec3(1., .98, .94), .1); }   // backdrop paper, a bit faded
+    s *= 1. - .3 * sh;
+    s = mix(s, vec3(1., .992, .965), max(b, sep));
+    vec2 fc = gl_FragCoord.xy;
+    float g = vnoise(fc * .45) * .55 + vnoise(fc * .06) * .45 + (hash(fc) - .5) * .25;
+    s *= .955 + .07 * g;
+    gl_FragColor = vec4(s, 1.);
+  }`;
+post.mat = new THREE.ShaderMaterial({
+  uniforms:{ tC:{ value:null }, tD:{ value:null }, tM:{ value:null }, res:{ value:new THREE.Vector2(1, 1) }, cn:{ value:camera.near }, cf:{ value:camera.far }, gp:{ value:20 }, rad:{ value:5 } },
+  vertexShader:'varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0., 1.); }',
+  fragmentShader:PIXEL ? PIXEL_FRAG : STICKER_FRAG,
+  depthTest:false, depthWrite:false,
+});
+post.scene.add(new THREE.Mesh(new THREE.PlaneGeometry(2, 2), post.mat));
+post.maskMat = new THREE.ShaderMaterial({
+  uniforms:{ tD:{ value:null }, res:{ value:new THREE.Vector2(1, 1) } },
+  vertexShader:'void main(){ gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.); }',
+  fragmentShader:'uniform sampler2D tD; uniform vec2 res; void main(){ if (gl_FragCoord.z > texture2D(tD, gl_FragCoord.xy / res).x + 1e-5) discard; gl_FragColor = vec4(1.); }',
+  side:THREE.DoubleSide,
+});
+const STICKER_LAYER = 1;
+camera.layers.enable(STICKER_LAYER); sun.shadow.camera.layers.enable(STICKER_LAYER);
+// aim-line dot for the sticker look: dark dot inside a white paper ring
+let _dotTex = null;
+function dotTex() {
+  if (_dotTex) return _dotTex;
+  const c = document.createElement('canvas'); c.width = c.height = 32; const g = c.getContext('2d');
+  g.fillStyle = '#fffaf0'; g.beginPath(); g.arc(16, 16, 15, 0, Math.PI * 2); g.fill();
+  g.fillStyle = '#2d3142'; g.beginPath(); g.arc(16, 16, 9, 0, Math.PI * 2); g.fill();
+  _dotTex = new THREE.CanvasTexture(c); _dotTex.encoding = THREE.sRGBEncoding; return _dotTex;
+}
+function sticker(o) { if (STICKER) o.traverse(n => { if (n.isMesh && !n.userData.flat) n.layers.set(STICKER_LAYER); }); return o; }
+function resizePost(w, h) {
+  if (!POST) return;
+  const pr = renderer.getPixelRatio(), dh = h * pr;
+  // sticker renders at (up to 1.5x) full resolution; pixel renders ~270 rows
+  post.px = PIXEL ? (parseInt(qs.get('px')) || Math.max(2, Math.round(dh / PIXEL_ROWS))) : Math.max(1, pr / 1.5);
+  post.w = Math.max(1, Math.floor(w * pr / post.px)); post.h = Math.max(1, Math.floor(dh / post.px));
+  if (post.rt) { post.rt.depthTexture.dispose(); post.rt.dispose(); }
+  if (post.mask) post.mask.dispose();
+  const filt = PIXEL ? THREE.NearestFilter : THREE.LinearFilter;
+  post.rt = new THREE.WebGLRenderTarget(post.w, post.h, { minFilter:filt, magFilter:filt, generateMipmaps:false });
+  post.rt.depthTexture = new THREE.DepthTexture(post.w, post.h);
+  const u = post.mat.uniforms;
+  u.tC.value = post.rt.texture; u.tD.value = post.rt.depthTexture; u.res.value.set(post.w, post.h);
+  if (STICKER) {
+    post.mask = new THREE.WebGLRenderTarget(post.w, post.h, { minFilter:THREE.LinearFilter, magFilter:THREE.LinearFilter, generateMipmaps:false });
+    u.tM.value = post.mask.texture;
+    post.maskMat.uniforms.tD.value = post.rt.depthTexture; post.maskMat.uniforms.res.value.set(post.w, post.h);
+  }
+  u.rad.value = Math.max(3, post.h / 85);   // sticker border ≈ 1.2% of screen height
+}
+const _clear = new THREE.Color();
+function render() {
+  if (!POST || !post.rt) { renderer.render(scene, camera); return; }
+  renderer.setRenderTarget(post.rt); renderer.render(scene, camera);
+  if (STICKER) {
+    const bg = scene.background, ca = renderer.getClearAlpha(); renderer.getClearColor(_clear);
+    scene.background = null; scene.overrideMaterial = post.maskMat; camera.layers.set(STICKER_LAYER); renderer.setClearColor(0x000000, 1);
+    renderer.setRenderTarget(post.mask); renderer.render(scene, camera);
+    scene.background = bg; scene.overrideMaterial = null; camera.layers.enable(0); renderer.setClearColor(_clear, ca);
+  }
+  renderer.setRenderTarget(null); renderer.render(post.scene, post.cam);
+}
+
 // ---------------------------------------------------------------- assets
 const GEO = {}, MAT = {}, TEX = {};
 let meshBuf = null;
@@ -173,17 +315,17 @@ function geo(key) { return GEO[key] || (GEO[key] = buildGeometry(key)); }
 function tex(name) {
   if (TEX[name]) return TEX[name];
   const t = new THREE.Texture(); const img = new Image();
-  img.onload = () => { t.image = img; t.needsUpdate = true; if (img.width <= 64) { t.magFilter = THREE.NearestFilter; t.minFilter = THREE.NearestFilter; t.generateMipmaps = false; } };
+  img.onload = () => { t.image = img; t.needsUpdate = true; if (PIXEL) t.magFilter = THREE.NearestFilter; if (img.width <= 64) { t.magFilter = THREE.NearestFilter; t.minFilter = THREE.NearestFilter; t.generateMipmaps = false; } };
   img.src = A.tex[name]; t.encoding = THREE.sRGBEncoding; TEX[name] = t; return t;
 }
 function mat(name) {
   if (MAT[name]) return MAT[name];
   const d = A.scene.mats[name]; let m;
-  if (!d) m = new THREE.MeshLambertMaterial({ color:0xcccccc });
+  if (!d) m = litMat({ color:0xcccccc });
   else if (name === 'M_EnergyShield') m = new THREE.MeshBasicMaterial({ color:0x5fe8ff, transparent:true, opacity:.35, depthWrite:false, blending:THREE.AdditiveBlending });
   else if (/Unlit/.test(name) || d.shader === 'Unlit/Texture') m = new THREE.MeshBasicMaterial({ map:d.tex ? tex(d.tex) : null, fog:true });
   else {
-    m = new THREE.MeshLambertMaterial({ map:d.tex ? tex(d.tex) : null, color:new THREE.Color(d.color[0], d.color[1], d.color[2]) });
+    m = litMat({ map:d.tex ? tex(d.tex) : null, color:new THREE.Color(d.color[0], d.color[1], d.color[2]) });
     if (d.emi) { m.emissiveMap = tex(d.emi); m.emissive = new THREE.Color(1, 1, 1); }
   }
   m.name = name; MAT[name] = m; return m;
@@ -282,13 +424,13 @@ function buildLevel() {
     }
   }
   // terrain continues behind the track so trees / props stand on real ground
-  const topM = new THREE.MeshLambertMaterial({ color:pal[0] }), sideM = new THREE.MeshLambertMaterial({ color:pal[2] });
+  const topM = litMat({ color:pal[0] }), sideM = litMat({ color:pal[2] });
   const terrMats = [sideM, sideM, topM, sideM, sideM, sideM];
   for (const sg of segs) {
     const w = sg.x1 - sg.x0, o = new THREE.Mesh(new THREE.BoxGeometry(w + .002, 15, 19), terrMats);
     o.position.set((sg.x0 + sg.x1) / 2, sg.y - 7.5, 1.5 + 9.5); o.receiveShadow = true; level.add(o);
   }
-  const lawn = new THREE.Mesh(new THREE.PlaneGeometry(400, 60), new THREE.MeshLambertMaterial({ color:pal[0] }));
+  const lawn = new THREE.Mesh(new THREE.PlaneGeometry(400, 60), litMat({ color:pal[0] }));
   lawn.rotation.x = Math.PI / 2; lawn.position.set(0, Math.min(...segs.map(s => s.y)) - .02, 50); lawn.receiveShadow = true; level.add(lawn);
   const flat = (x, hw) => Math.abs(groundAt(x - hw) - groundAt(x + hw)) < .01 && Math.abs(groundAt(x) - groundAt(x + hw)) < .01;
   // bridges
@@ -297,11 +439,11 @@ function buildLevel() {
     for (let i = 0; i < n; i++) {
       const x = b.x0 + (i + .5) * (w / n);
       if (pf) { const o = inst(pf, { receive:true }); o.position.set(b.x0 + i * (w / n), groundAt(x) - .05, 0); o.scale.x = (w / n); level.add(o); }
-      else { const o = new THREE.Mesh(new THREE.BoxGeometry(w / n * .96, .14, 2.4), new THREE.MeshLambertMaterial({ color:0x8a5a34 })); o.position.set(x, groundAt(x) - .07, 0); o.castShadow = o.receiveShadow = true; level.add(o); }
+      else { const o = new THREE.Mesh(new THREE.BoxGeometry(w / n * .96, .14, 2.4), litMat({ color:0x8a5a34 })); o.position.set(x, groundAt(x) - .07, 0); o.castShadow = o.receiveShadow = true; level.add(o); }
     }
   }
   for (const wtr of (layout.water || [])) {
-    const o = new THREE.Mesh(new THREE.BoxGeometry(wtr.x1 - wtr.x0, 4, 3.2), new THREE.MeshLambertMaterial({ color:0x3f8fd0, transparent:true, opacity:.7 }));
+    const o = new THREE.Mesh(new THREE.BoxGeometry(wtr.x1 - wtr.x0, 4, 3.2), litMat({ color:0x3f8fd0, transparent:true, opacity:.7 }));
     o.position.set((wtr.x0 + wtr.x1) / 2, wtr.y - 2, 0); level.add(o);
   }
   for (const ov of (layout.overhead || [])) {
@@ -313,21 +455,21 @@ function buildLevel() {
   for (let x = x0; x < x1; x += rand(3.5, 7) / th.density) {
     const t = inst(th.trees[(R() * th.trees.length) | 0], { shadow:false }); const z = 4.5 + R() * 9;
     if (!flat(x, .3)) continue;
-    t.position.set(x, groundAt(x) - .02, z); t.rotation.y = R() * 6.28; t.scale.setScalar(.38 + R() * .3); level.add(t);
+    t.position.set(x, groundAt(x) - .02, z); t.rotation.y = R() * 6.28; t.scale.setScalar(.38 + R() * .3); level.add(sticker(t));
   }
   for (let x = x0; x < x1; x += 2.5 + R() * 5) {
     if (!flat(x, .6)) continue;
-    const d = inst(th.decor[(R() * th.decor.length) | 0], { shadow:true }); d.position.set(x, groundAt(x), .9 + R() * .5); d.rotation.y = (R() - .5) * 1.2; level.add(d);
+    const d = inst(th.decor[(R() * th.decor.length) | 0], { shadow:true }); d.position.set(x, groundAt(x), .9 + R() * .5); d.rotation.y = (R() - .5) * 1.2; level.add(sticker(d));
   }
   for (let x = x0; x < x1; x += 3) {
     if (Math.abs(groundAt(x) - groundAt(x + 3)) > .01) continue;
-    const f = inst(th.fence, { shadow:false }); f.position.set(x, groundAt(x), 1.45); level.add(f);
+    const f = inst(th.fence, { shadow:false }); f.position.set(x, groundAt(x), 1.45); level.add(sticker(f));
   }
-  for (let x = x0 + 4; x < x1; x += 11) { let lx = x; while (!flat(lx, .25) && lx < x + 3) lx += .2; const l = inst(th.lamp); l.position.set(lx, groundAt(lx), 1.25); level.add(l); }
+  for (let x = x0 + 4; x < x1; x += 11) { let lx = x; while (!flat(lx, .25) && lx < x + 3) lx += .2; const l = inst(th.lamp); l.position.set(lx, groundAt(lx), 1.25); level.add(sticker(l)); }
   // voxel hills (mid + far ridges, palette driven)
   const hill = (z, step, base, amp, top, side, seedOff) => {
     const g = new THREE.BoxGeometry(1, 1, 1); g.translate(0, -.5, 0);
-    const n = Math.ceil(300 / step); const im = new THREE.InstancedMesh(g, new THREE.MeshLambertMaterial(), n);
+    const n = Math.ceil(300 / step); const im = new THREE.InstancedMesh(g, litMat(), n);
     const c = new THREE.Color();
     for (let i = 0; i < n; i++) {
       const x = -150 + i * step;
@@ -345,12 +487,12 @@ function buildLevel() {
   const bgTex = tex('T_BG_' + th.id);
   bgPlane.material.map = bgTex; bgPlane.material.needsUpdate = true;
   for (let i = 0; i < 6; i++) {
-    const c = inst(i % 2 ? 'P_CloudA' : 'P_CloudB', { shadow:false }); c.position.set(-60 + i * 30 + rand(-6, 6), 13 + rand(0, 6), 70 + rand(0, 25)); c.scale.setScalar(1.2 + Math.random()); c.userData.drift = rand(.2, .5); level.add(c); clouds.push(c);
+    const c = inst(i % 2 ? 'P_CloudA' : 'P_CloudB', { shadow:false }); c.position.set(-60 + i * 30 + rand(-6, 6), 13 + rand(0, 6), 70 + rand(0, 25)); c.scale.setScalar(1.2 + Math.random()); c.userData.drift = rand(.2, .5); level.add(sticker(c)); clouds.push(c);
   }
   // goal flag + best distance flag
-  const flag = inst('P_FlagPole'); flag.position.set(layout.goalX, groundAt(layout.goalX), .4); flag.scale.setScalar(1.3); level.add(flag);
+  const flag = inst('P_FlagPole'); flag.position.set(layout.goalX, groundAt(layout.goalX), .4); flag.scale.setScalar(1.3); level.add(sticker(flag));
   const best = save.best[save.level] || 0;
-  if (best > 2 && -best > layout.goalX + 1) { const bf = inst('P_FlagPole'); bf.position.set(-best, groundAt(-best), .5); bf.scale.setScalar(.8); level.add(bf); }
+  if (best > 2 && -best > layout.goalX + 1) { const bf = inst('P_FlagPole'); bf.position.set(-best, groundAt(-best), .5); bf.scale.setScalar(.8); level.add(sticker(bf)); }
 }
 const clouds = [];
 const bgPlane = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.MeshBasicMaterial({ fog:false, depthWrite:false }));
@@ -360,7 +502,7 @@ bgPlane.renderOrder = -10; scene.add(bgPlane);
 const FX = {};
 (function initFx() {
   const N = 700; const g = new THREE.BoxGeometry(1, 1, 1);
-  const m = new THREE.MeshLambertMaterial();
+  const m = litMat();
   const im = new THREE.InstancedMesh(g, m, N); im.instanceMatrix.setUsage(THREE.DynamicDrawUsage); im.frustumCulled = false;
   im.setColorAt(0, new THREE.Color()); world.add(im);
   FX.cubes = { im, N, p:[], next:0 };
@@ -710,8 +852,9 @@ class Player {
     }
     if (wdef.kind === 'bow' && this.holder) { this.nock = inst('P_Arrow', { shadow:true }); this.weapon.add(this.nock); }
     const N = 26; this.dots = new THREE.Points(new THREE.BufferGeometry().setAttribute('position', new THREE.BufferAttribute(new Float32Array(N * 3), 3)),
-      new THREE.PointsMaterial({ color:0xffffff, size:7, sizeAttenuation:false, transparent:true, opacity:.85, depthTest:false }));
+      new THREE.PointsMaterial({ color:0xffffff, map:STICKER ? dotTex() : null, alphaTest:STICKER ? .5 : 0, size:PIXEL ? 2 / renderer.getPixelRatio() : STICKER ? 11 : 7, sizeAttenuation:false, transparent:true, opacity:.85, depthTest:false }));
     this.dots.renderOrder = 30; this.dots.frustumCulled = false; world.add(this.dots);
+    sticker(this.root); if (this.holder) sticker(this.holder);
   }
   updateAimLine() {
     const d = this.def, pos = this.dots.geometry.attributes.position, N = pos.count;
@@ -790,7 +933,7 @@ class Player {
       burst(m.x, m.y, 0, [1, 1, 1], 3, 1.2, .04, .4, .3, .2);
     } else {
       // visible bullet (swept against hurtboxes every frame) + muzzle flash, smoke, brass
-      const sp = d.plasma ? 34 : 42;
+      const sp = d.plasma ? 28 : 32;
       game.projectiles.push(new Projectile(d, m.x, m.y, dir.x * sp, dir.y * sp, this.damage(), true));
       const col3 = d.plasma ? 0x60ff90 : 0xffc860, ang = Math.atan2(dir.y, dir.x);
       muzzleFlash(m.x + dir.x * .08, m.y + dir.y * .08, d.plasma ? .8 : .6, col3);
@@ -927,34 +1070,69 @@ class Player {
 function projSpeed(d) { return d.speed * (d.thrown ? RB.throwSpeed(save.up.thr) : 1); }
 const PROJ_G = 1;
 const bulletGeo = new THREE.BoxGeometry(1, 1, 1);
+const tailGeo = new THREE.BoxGeometry(1, 1, 1).translate(0, 0, -.5);
 const bulletMats = {};
+const bmat = (key, make) => bulletMats[key] || (bulletMats[key] = make());
+// The weapon models' projectiles are only a few cm across; scale them up so they read at gameplay camera distance.
+const PROJ_SCALE = { P_Stone:2.6, P_Arrow:1.7, P_SpearProjectile:1.3, P_Bolt:2, P_StarProjectile:2.6 };
 function makeBullet(def) {
-  const c = def.plasma ? 0x6dff9a : 0xffe08a;
-  const m = bulletMats[c] || (bulletMats[c] = new THREE.MeshBasicMaterial({ color:c, transparent:true, blending:THREE.AdditiveBlending, depthWrite:false }));
+  // opaque core + dark outline + streak tail so the bullet stays visible against the bright sky (additive alone washes out)
+  const c = def.plasma ? 0x7dffa8 : 0xffe46a, edge = def.plasma ? 0x0d5a2a : 0x6a3c08;
   const g = new THREE.Group();
-  const core = new THREE.Mesh(bulletGeo, m); core.scale.set(def.plasma ? .16 : .1, def.plasma ? .16 : .1, def.plasma ? .75 : .6); g.add(core);
-  const glow = new THREE.Sprite(new THREE.SpriteMaterial({ map:FX.flashTex, color:c, transparent:true, blending:THREE.AdditiveBlending, depthWrite:false }));
-  glow.scale.setScalar(def.plasma ? .95 : .7); g.add(glow);
+  // in pixel mode the post pass draws the outline, so the bullet can be slimmer and skip the back-face shell
+  const s = (def.plasma ? .2 : .15) * (POST ? .7 : 1), len = (def.plasma ? .9 : .7) * (POST ? .75 : 1);
+  if (!POST) {
+    const outline = new THREE.Mesh(bulletGeo, bmat('o' + edge, () => new THREE.MeshBasicMaterial({ color:edge, side:THREE.BackSide })));
+    outline.scale.set(s * 1.6, s * 1.6, len * 1.15); g.add(outline);
+  }
+  const core = new THREE.Mesh(bulletGeo, bmat('c' + c, () => new THREE.MeshBasicMaterial({ color:c }))); core.scale.set(s, s, len); g.add(core);
+  const tail = new THREE.Mesh(tailGeo, bmat('t' + c, () => new THREE.MeshBasicMaterial({ color:c, transparent:true, opacity:.55, depthWrite:false })));
+  tail.scale.set(s * .8, s * .8, .01); tail.position.z = -len / 2; g.add(tail);
+  g.userData.tail = tail; tail.userData.flat = true; g.userData.tailLen = def.plasma ? 2 : 1.8;
+  const glow = new THREE.Sprite(bmat('g' + c, () => new THREE.SpriteMaterial({ map:FX.flashTex, color:c, transparent:true, blending:THREE.AdditiveBlending, depthWrite:false })));
+  glow.scale.setScalar(def.plasma ? 1.1 : .85); g.add(glow);
+  g.traverse(o => { o.renderOrder = 15; });
+  return g;
+}
+// streak behind physical projectiles (stone, arrow, spear, bolt, shuriken) — kept separate so it doesn't spin with the model
+function makeStreak(def) {
+  const g = new THREE.Group();
+  const outline = new THREE.Mesh(tailGeo, bmat('so', () => new THREE.MeshBasicMaterial({ color:0x2a2018, transparent:true, opacity:.45, depthWrite:false })));
+  outline.scale.set(.1, .1, 1.1); g.add(outline);
+  const core = new THREE.Mesh(tailGeo, bmat('sc', () => new THREE.MeshBasicMaterial({ color:0xfff6dc, transparent:true, opacity:.9, depthWrite:false })));
+  core.scale.set(.055, .055, 1); core.position.z = -.03; g.add(core);
+  g.traverse(o => { o.renderOrder = 14; o.userData.flat = true; });
   return g;
 }
 class Projectile {
   constructor(def, x, y, vx, vy, dmg, bullet) {
     this.def = def; this.x = x; this.y = y; this.vx = vx; this.vy = vy; this.dmg = dmg; this.life = bullet ? 1.2 : 3; this.stuck = null; this.hitSet = new Set(); this.pierce = def.pierce || 1;
     this.bullet = !!bullet; this.grav = bullet ? 0 : def.grav;
-    this.o = bullet ? makeBullet(def) : inst(def.proj, { shadow:true }); world.add(this.o); this.spin = 0; this.place();
-    this.trailCol = bullet ? (def.plasma ? [.4, 1, .6] : [1, .85, .45]) : [1, 1, 1];
+    this.o = bullet ? makeBullet(def) : inst(def.proj, { shadow:true }); world.add(sticker(this.o)); this.spin = 0;
+    if (!bullet) { this.o.scale.setScalar(PROJ_SCALE[def.proj] || 2); this.streak = makeStreak(def); world.add(this.streak); }
+    this.place();
+    this.trailCol = bullet ? (def.plasma ? [.4, 1, .6] : [1, .85, .45]) : def.color;
   }
   place() {
     this.o.position.set(this.x, this.y, 0);
     if (this.def.spin) { this.spin += this.def.spin * Math.PI / 180 / 60; this.o.rotation.set(0, 0, this.spin); }
     else { _v.set(this.vx, this.vy, 0).normalize(); this.o.quaternion.setFromUnitVectors(_v2.set(0, 0, 1), _v); }
+    this.growTail();
+    if (this.streak) {
+      _v.set(this.vx, this.vy, 0).normalize();
+      this.streak.position.set(this.x, this.y, 0); this.streak.quaternion.setFromUnitVectors(_v2.set(0, 0, 1), _v);
+      // grows in over the first few frames so it never pokes back through the player
+      this.streak.scale.z = Math.min(1.2, (this.age || 0) * 14);
+    }
   }
+  growTail() { const u = this.o.userData; if (u.tail) u.tail.scale.z = Math.max(.01, Math.min(u.tailLen, (this.age || 0) * 28)); }
+  removeStreak() { if (this.streak) { world.remove(this.streak); this.streak = null; } }
   update(dt) {
-    this.life -= dt;
+    this.life -= dt; this.age = (this.age || 0) + dt;
     if (this.stuck) { if (this.life <= 0) this.dead = true; return; }
     const g = PROJ_G * this.grav;
     const nx = this.x + this.vx * dt, nvy = this.vy - g * dt, ny = this.y + nvy * dt;
-    trail(this.x, this.y, this.trailCol, this.bullet ? .08 : .05, this.bullet ? .16 : .25);
+    trail(this.x, this.y, this.trailCol, this.bullet ? .1 : .09, this.bullet ? .2 : .35);
     const hit = castShot(this.x, this.y, nx, ny, this.hitSet);
     if (hit) {
       const hx = lerp(this.x, nx, hit.t), hy = lerp(this.y, ny, hit.t);
@@ -976,11 +1154,12 @@ class Projectile {
     if (this.life <= 0 || this.y < -20) this.dead = true;
   }
   stick(part) {
+    this.removeStreak();
     if (!this.def.stick) { this.dead = true; return; }
     this.stuck = part || true; this.life = 2.5;
     if (part) part.attach(this.o);
   }
-  dispose() { if (this.o.parent) this.o.parent.remove(this.o); }
+  dispose() { this.removeStreak(); if (this.o.parent) this.o.parent.remove(this.o); }
 }
 class FallingPayload {
   constructor(o, x, y, vx) { this.o = o; this.x = x; this.y = y; this.vx = vx; this.vy = 0; world.attach(o); }
@@ -997,7 +1176,7 @@ class Enemy {
   constructor(prefab, tier, x) {
     const info = ENEMY[prefab] || { voice:'Undead' };
     this.prefab = prefab; this.tier = tier; this.voice = info.voice; this.role = info.role || 'walker'; this.info = info;
-    this.root = inst(prefab); this.parts = this.root.userData.parts; world.add(this.root);
+    this.root = inst(prefab); this.parts = this.root.userData.parts; world.add(sticker(this.root));
     this.hurt = this.root.userData.boxes.filter(o => o !== this.root);
     // own materials so hits can flash white
     this.flashMats = []; this.hitFlash = 0;
@@ -1215,6 +1394,7 @@ function shake(a) { cam.shake = Math.min(.5, cam.shake + a); }
 function resize() {
   const w = Math.max(1, innerWidth || canvas.clientWidth || 1), h = Math.max(1, innerHeight || canvas.clientHeight || 1);
   renderer.setSize(w, h, false); camera.aspect = w / h; camera.updateProjectionMatrix();
+  resizePost(w, h);
 }
 function updateCamera(dt, snap) {
   if (!isFinite(camera.aspect) || camera.aspect <= 0) resize();
@@ -1226,7 +1406,11 @@ function updateCamera(dt, snap) {
   cam.shake = Math.max(0, cam.shake - dt * 1.4);
   cam.kick = Math.max(0, cam.kick - dt * 2.5);
   const s = cam.shake * cam.shake + cam.kick * cam.kick; const sx = rand(-1, 1) * s * .6, sy = rand(-1, 1) * s * .6;
-  camera.position.set(cam.x + sx, cam.y + sy + 1.2, dist); camera.lookAt(cam.x + sx, cam.y + sy, 0);
+  // snap the camera to whole low-res pixels on the gameplay plane so static scenery doesn't shimmer while scrolling
+  const wpp = PIXEL ? 2 * halfH / post.h : 0, snapPx = v => wpp ? Math.round(v / wpp) * wpp : v;
+  const px = snapPx(cam.x + sx), py = snapPx(cam.y + sy);
+  camera.position.set(px, py + 1.2, dist); camera.lookAt(px, py, 0);
+  post.mat.uniforms.gp.value = dist;
   game.camRight = cam.x + cam.halfW;
   sun.position.set(cam.x - 8, cam.y + 16, 12); sun.target.position.set(cam.x, cam.y - 2, 0);
   // painted backdrop parallax
@@ -1238,14 +1422,22 @@ function updateCamera(dt, snap) {
 }
 
 // ---------------------------------------------------------------- input (RunInput)
-const input = { down:false, point:null, sx:0, sy:0, has:false };
+// aimLock: after FIGHT the aim picked on the upgrade screen is kept until the player presses on the playfield again,
+// so moving the mouse off the FIGHT button doesn't swing the gun.
+const input = { down:false, point:null, sx:0, sy:0, has:false, aimLock:false };
 const raycaster = new THREE.Raycaster(); const plane = new THREE.Plane(new V3(0, 0, 1), 0);
 function pointerToWorld(cx, cy) {
   const ndc = new THREE.Vector2(cx / innerWidth * 2 - 1, -(cy / innerHeight) * 2 + 1);
   raycaster.setFromCamera(ndc, camera); const p = new V3(); if (!raycaster.ray.intersectPlane(plane, p)) return null; p.z = 0; return p;
 }
-canvas.addEventListener('pointerdown', e => { unlockAudio(); input.down = true; input.sx = e.clientX; input.sy = e.clientY; input.has = true; canvas.setPointerCapture(e.pointerId); hideHint(); });
-canvas.addEventListener('pointermove', e => { input.sx = e.clientX; input.sy = e.clientY; input.has = true; });
+canvas.addEventListener('pointerdown', e => { unlockAudio(); input.down = true; input.aimLock = false; input.sx = e.clientX; input.sy = e.clientY; input.has = true; canvas.setPointerCapture(e.pointerId); hideHint(); });
+canvas.addEventListener('pointermove', e => {
+  // the aim only follows a press that started on the playfield; hovering (on the way to a button) never moves it,
+  // except mouse hover-aim during the run once the post-FIGHT lock is released
+  const hover = game.state === 'playing' && !input.aimLock && e.pointerType === 'mouse';
+  if (!input.down && !hover) return;
+  input.sx = e.clientX; input.sy = e.clientY; input.has = true;
+});
 const up = () => { input.down = false; };
 canvas.addEventListener('pointerup', up); canvas.addEventListener('pointercancel', up);
 addEventListener('keydown', e => { if (e.code === 'Space') { input.down = true; unlockAudio(); } });
@@ -1321,6 +1513,7 @@ function spawnerTick() {
 }
 function beginRun() {
   unlockAudio(); sfx('Tap_1', .7);
+  input.down = false; input.aimLock = true;
   game.state = 'playing'; showScreen(null); $('hud').classList.remove('hidden'); $('btn-pause').classList.remove('hidden');
   game.streak = 0; game.lastKillT = -9; banner('GO!', '#8ef08a');
   if (!save.best[save.level]) showHint();
@@ -1440,7 +1633,7 @@ function showVictory() {
   $('hud').classList.add('hidden'); showScreen('victory'); sfx('Reward', .7);
 }
 function updateCross() {
-  const c = $('cross'); const show = game.state === 'playing' && input.has && !game.paused;
+  const c = $('cross'); const show = (game.state === 'playing' || game.state === 'prerun') && input.has && !game.paused;
   c.classList.toggle('hidden', !show); if (!show) return;
   c.style.left = input.sx + 'px'; c.style.top = input.sy + 'px'; c.classList.toggle('fire', input.down);
 }
@@ -1469,7 +1662,7 @@ function frame(now) {
 }
 function step(dt) {
   if (game.state === 'loading') return;
-  if (game.paused && game.state === 'playing') { renderer.render(scene, camera); return; }
+  if (game.paused && game.state === 'playing') { render(); return; }
   if (game.slowT > 0) { game.slowT -= dt; dt *= .25; }
   input.point = input.has ? pointerToWorld(input.sx, input.sy) : null;
   const pl = game.player;
@@ -1494,7 +1687,7 @@ function step(dt) {
   game.projectiles = game.projectiles.filter(p => { if (p.dead) { p.dispose(); return false; } return true; });
   game.payloads = game.payloads.filter(p => !p.dead);
   updateFx(dt); updateCamera(dt); updateTexts(dt); updateCross();
-  renderer.render(scene, camera);
+  render();
 }
 
 // ---------------------------------------------------------------- boot

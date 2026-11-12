@@ -56,6 +56,11 @@
   /* panels */
   .screen { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:flex-end; padding:16px 16px max(20px,env(safe-area-inset-bottom)); background:linear-gradient(transparent 35%, rgba(20,24,34,.55)); }
   .screen.center { justify-content:center; background:rgba(20,24,34,.55); }
+  /* the upgrade screen lets touches through to the canvas so the player can pick the aim before FIGHT */
+  #prerun { pointer-events:none; }
+  #prerun > * { pointer-events:auto; }
+  #prerun > .subtitle, #prerun > .aimtip { pointer-events:none; }
+  .aimtip { font-size:16px; font-weight:700; margin-bottom:10px; text-align:center; animation:pulse 1.2s infinite; }
   .era { display:flex; align-items:center; gap:12px; margin-bottom:10px; }
   .era img { width:64px; height:64px; border-radius:50%; }
   .era .t1 { font-size:16px; font-weight:600; opacity:.9; }
@@ -130,6 +135,7 @@
   <div id="hint" class="stroke hidden">Kéo / di chuột để ngắm · Giữ để bắn</div>
 
   <div id="prerun" class="screen hidden">
+    <div class="aimtip stroke">👆 Kéo màn hình để chọn hướng bắn</div>
     <div class="era"><img id="era-icon" alt=""><div><div class="t1 stroke" id="era-level">LEVEL 1</div><div class="t2 stroke" id="era-name">STONE AGE</div></div></div>
     <div class="cards" id="cards"></div>
     <button class="bigbtn stroke" id="btn-fight">FIGHT</button>
